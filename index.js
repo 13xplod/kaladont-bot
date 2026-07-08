@@ -2,7 +2,7 @@
 // Features channel-based games, turn order, word chaining, proper noun blocking, and dictionary validation.
 require('dotenv').config();
 const fs = require('fs');
-const { Client, GatewayIntentBits, Events, EmbedBuilder, ChannelType, PermissionsBitField } = require('discord.js');
+const { Client, GatewayIntentBits, Events, EmbedBuilder, ChannelType, PermissionsBitField, ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
 
 const token = process.env.DISCORD_TOKEN;
 const ADMIN_USER_ID = process.env.ADMIN_USER_ID;
@@ -12,7 +12,7 @@ if (!token) {
 }
 
 const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent] });
-const BOT_VERSION = '0.1.3-beta';
+const BOT_VERSION = '0.2.0-beta';
 // Timers (ms)
 const LOBBY_DURATION_MS = 2 * 60 * 1000; // 2 minutes to join
 const TURN_DURATION_MS = 30 * 1000; // 30 seconds per turn
@@ -113,6 +113,7 @@ function createGame(channel, starterId) {
     turnTimeout: null,
     startTimestamp: null,
     eliminatedPlayers: [],
+    lobbyMessage: null,
     state: 'lobby',
   };
   games.set(channel.id, game);
@@ -124,6 +125,24 @@ function clearTurnTimer(game) {
   if (game?.turnTimeout) {
     clearTimeout(game.turnTimeout);
     game.turnTimeout = null;
+  }
+}
+
+async function disableLobbyButton(game) {
+  if (!game?.lobbyMessage) return;
+
+  const disabledButton = new ButtonBuilder()
+    .setCustomId('kaladont-join')
+    .setLabel('Pridruživanje zatvoreno')
+    .setStyle(ButtonStyle.Secondary)
+    .setDisabled(true);
+
+  const disabledRow = new ActionRowBuilder().addComponents(disabledButton);
+
+  try {
+    await game.lobbyMessage.edit({ components: [disabledRow] });
+  } catch (error) {
+    console.error('Failed to disable lobby button:', error);
   }
 }
 
@@ -210,6 +229,7 @@ async function eliminatePlayer(channel, game, playerId, reason, detailText) {
       game.gameTimeout = null;
     }
     clearTimeInterval(game);
+    await disableLobbyButton(game);
     games.delete(channel.id);
     await sendEmbed(channel, {
       title: 'Kraj igre',
@@ -229,6 +249,7 @@ async function eliminatePlayer(channel, game, playerId, reason, detailText) {
       game.gameTimeout = null;
     }
     clearTimeInterval(game);
+    await disableLobbyButton(game);
     games.delete(channel.id);
     await sendEmbed(channel, {
       title: 'Kraj igre',
@@ -239,9 +260,10 @@ async function eliminatePlayer(channel, game, playerId, reason, detailText) {
   }
 
   const remainingPlayers = game.players.map(mention).join(', ');
+  const nextPlayer = getCurrentPlayer(game);
   await sendEmbed(channel, {
     title: 'Igrač eliminisan',
-    description: `❌ ${mention(playerId)} je eliminisan/a jer ${detailText}. Preostali igrači: ${remainingPlayers}.`,
+    description: `❌ ${mention(playerId)} je eliminisan/a jer ${detailText}. Preostali igrači: ${remainingPlayers}.\n\nSledeći na redu je: ${nextPlayer ? mention(nextPlayer) : 'nema više igrača'}`,
     color: 0xe74c3c,
   });
 
@@ -253,8 +275,10 @@ async function startGame(channel) {
   const game = getGame(channel.id);
   if (!game) return;
   game.joiningOpen = false;
+  await disableLobbyButton(game);
 
   if (game.players.length < 2) {
+    await disableLobbyButton(game);
     games.delete(channel.id);
     await sendEmbed(channel, {
       title: 'Igra otkazana',
@@ -350,6 +374,37 @@ client.once(Events.ClientReady, () => {
   console.log(`Logged in as ${client.user.tag}`);
 });
 
+client.on(Events.InteractionCreate, async (interaction) => {
+  if (!interaction.isButton() || interaction.customId !== 'kaladont-join') return;
+
+  const channel = interaction.channel;
+  const authorId = interaction.user.id;
+  const game = getGame(channel?.id);
+
+  if (!channel || !game) {
+    return interaction.reply({ content: 'Nema aktivne igre u ovom kanalu.', ephemeral: true });
+  }
+
+  if (game.state !== 'lobby') {
+    return interaction.reply({ content: 'Pridruživanje je zatvoreno, igra je već počela.', ephemeral: true });
+  }
+
+  if (game.players.includes(authorId)) {
+    return interaction.reply({ content: 'Već si u igri. Sačekaj svoj red.', ephemeral: true });
+  }
+
+  game.players.push(authorId);
+  game.scores.set(authorId, 0);
+
+  return interaction.reply({
+    embeds: [makeEmbed({
+      title: 'Igrač pridružen',
+      description: `${mention(authorId)} se pridružio/la igri.\n Morate sačekati da igra počne.\n Trenutno je na redu ${mention(getCurrentPlayer(game))}.`,
+      color: 0x3498db,
+    })],
+  });
+});
+
 client.on(Events.MessageCreate, async (message) => {
   if (message.author.bot) return;
 
@@ -403,12 +458,24 @@ client.on(Events.MessageCreate, async (message) => {
       );
     }
 
-    createGame(message.channel, authorId);
-    return replyEmbed(message, {
-      title: 'Igra započeta',
-      description: `🟢 Igra Kaladont je u lobby-u! ${mention(authorId)} je prvi.\n Drugi igrači se mogu pridružiti sa !join ili !j.\n Morate sačekati da igra počne, a onda će svako igrati protiv svih ostalih.\n Imate 2 minute da se pridružite.\n Piši reči bez prefiksa.\n Ako ne odgovoriš u 30 sekundi, gubiš.\n Reč koja se završava sa "-ka" takođe eliminiše igrača.`,
-      color: 0x2ecc71,
+    const newGame = createGame(message.channel, authorId);
+    const joinButton = new ButtonBuilder()
+      .setCustomId('kaladont-join')
+      .setLabel('Pridruži se')
+      .setStyle(ButtonStyle.Primary);
+    const joinRow = new ActionRowBuilder().addComponents(joinButton);
+
+    const lobbyMessage = await message.reply({
+      embeds: [makeEmbed({
+        title: 'Igra započeta',
+        description: `🟢 Igra Kaladont je u lobby-u! ${mention(authorId)} je prvi.\n Drugi igrači se mogu pridružiti sa !join ili !j, ili kliknuti dugme ispod.\n Morate sačekati da igra počne, a onda će svako igrati protiv svih ostalih.\n Imate 2 minute da se pridružite.\n Piši reči bez prefiksa.\n Ako ne odgovoriš u 30 sekundi, gubiš.\n Reč koja se završava sa "-ka" takođe eliminiše igrača.`,
+        color: 0x2ecc71,
+      })],
+      components: [joinRow],
     });
+
+    newGame.lobbyMessage = lobbyMessage;
+    return lobbyMessage;
   }
 
   if (content === '!join' || content === '!j') {
@@ -451,6 +518,9 @@ client.on(Events.MessageCreate, async (message) => {
       if (game.joinTimeout) {
         clearTimeout(game.joinTimeout);
       }
+      clearTurnTimer(game);
+      clearTimeInterval(game);
+      await disableLobbyButton(game);
       games.delete(channelId);
       return replyEmbed(message, {
         title: 'Igra otkazana',
@@ -499,6 +569,8 @@ client.on(Events.MessageCreate, async (message) => {
     if (game.gameTimeout) {
       clearTimeout(game.gameTimeout);
     }
+    clearTurnTimer(game);
+    clearTimeInterval(game);
 
     if (game.state === 'playing') {
       const results = [...game.scores.entries()];
