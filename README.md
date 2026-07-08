@@ -121,4 +121,4 @@ https://github.com/13xplod/kaladont-bot
 
 ## License
 
-This project is currently unlicensed. Add a license if you plan to make it open-source.
+This project is licensed under the MIT License — see the [LICENSE](LICENSE) file for details.
